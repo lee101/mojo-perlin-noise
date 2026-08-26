@@ -66,7 +66,7 @@ points = np.array([
 print(perlin.noise_array(points))
 # [-0.046672   -0.25040776  0.        ]
 
-# GPU execution is explicit; GPU failures raise RuntimeError.
+# GPU execution is explicit; unavailable or busy GPUs fall back to CPU.
 print(perlin.noise_array(points, device="gpu"))
 
 simplex = SimplexNoise(seed=42, octaves=3)
@@ -88,13 +88,13 @@ the outputs before printing any result. The GPU row is run only when
 
 | Kernel | Samples | Mojo | Reference | Speedup | Compared with |
 |---|---:|---:|---:|---:|---|
-| Perlin 2D scalar calls | 1,000 | 42.61 ms | 182.82 ms | 4.29x | perlin-noise 1.14 |
-| Perlin 2D batch | 10,000 | 306.37 ms | 2014.14 ms | 6.57x | perlin-noise 1.14 |
-| Perlin 2D batch, GPU | 10,000 | 1.53 ms | 306.37 ms | 200.12x | Mojo CPU |
-| Perlin 3D batch | 5,000 | 291.33 ms | 1691.55 ms | 5.81x | perlin-noise 1.14 |
-| Perlin 4D batch | 2,000 | 230.63 ms | 1362.99 ms | 5.91x | perlin-noise 1.14 |
-| Simplex 2D, 3 octaves | 25,000 | 5.76 ms | 770.96 ms | 133.87x | pure Python |
-| Simplex 3D, 3 octaves | 15,000 | 5.17 ms | 574.42 ms | 111.19x | pure Python |
+| Perlin 2D scalar calls | 1,000 | 33.26 ms | 148.45 ms | 4.46x | perlin-noise 1.14 |
+| Perlin 2D batch | 10,000 | 33.25 ms | 1551.36 ms | 46.65x | perlin-noise 1.14 |
+| Perlin 2D batch, GPU | 10,000 | 1.45 ms | 33.25 ms | 22.96x | Mojo CPU |
+| Perlin 3D batch | 5,000 | 47.60 ms | 1657.28 ms | 34.81x | perlin-noise 1.14 |
+| Perlin 4D batch | 2,000 | 48.28 ms | 1378.19 ms | 28.55x | perlin-noise 1.14 |
+| Simplex 2D, 3 octaves | 25,000 | 5.36 ms | 589.99 ms | 110.00x | pure Python |
+| Simplex 3D, 3 octaves | 15,000 | 5.15 ms | 548.62 ms | 106.48x | pure Python |
 
 The Perlin and simplex reference rows compare a Mojo call with the scalar-only
 upstream Perlin API or a scalar pure-Python simplex loop. The GPU row compares
@@ -126,12 +126,17 @@ Mersenne Twister and draws one uniform value per dimension. The Mojo kernel
 reproduces CPython's integer seeding, MT19937 twist, and 53-bit `random()` path,
 then applies the upstream fade and coordinate-hash rules. The independent
 lanes of the MT19937 twist use native-width SIMD with scalar remainder loops.
-This is why seeded results match the Python package to floating-point rounding
-rather than merely producing a similar-looking field.
+Per-axis lattice, distance, and fade setup uses float64 SIMD with a scalar tail,
+and the common one-word MT seed avoids generic multi-word branches. Large CPU
+batches are split into 256-row tasks across at most 16 workers; batches below
+1,024 rows remain serial. Seeded results still match the Python package to
+floating-point rounding rather than merely producing a similar-looking field.
 
 Perlin's arithmetic-heavy batch kernel also has an explicit `device="gpu"`
-path. Device buffers are scoped to one call and capped below 2 GB. Context,
-allocation, or launch failures raise `RuntimeError`; CPU remains the default.
+path. It is attempted only when `nvidia-smi` reports at least 4,000 MiB free.
+Device buffers are scoped to one call and capped below 2 GB. Missing devices,
+low free memory, and context, allocation, or launch failures fall back to CPU;
+CPU remains the default.
 
 Simplex uses the classic 256-entry permutation and simplex-corner attenuation
 in 2D or 3D. A seeded xorshift64* Fisher-Yates shuffle creates stable alternate

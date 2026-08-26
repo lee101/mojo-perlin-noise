@@ -5,6 +5,8 @@ from __future__ import annotations
 import random
 import math
 import numbers
+import subprocess
+import time
 from functools import lru_cache
 from typing import Iterable, List, Optional, Tuple, Union
 
@@ -16,6 +18,30 @@ from .tools import hasher
 
 Coordinate = Union[int, float, List, Tuple]
 TileSize = Optional[Union[int, List, Tuple]]
+
+_GPU_MEMORY_CACHE = (0.0, False)
+
+
+def _gpu_memory_available() -> bool:
+    global _GPU_MEMORY_CACHE
+    now = time.monotonic()
+    if now - _GPU_MEMORY_CACHE[0] < 1.0:
+        return _GPU_MEMORY_CACHE[1]
+    try:
+        output = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.free",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+        available = min(int(line.strip()) for line in output.splitlines()) >= 4_000
+    except (OSError, subprocess.CalledProcessError, ValueError):
+        available = False
+    _GPU_MEMORY_CACHE = (now, available)
+    return available
 
 
 class PerlinNoise:
@@ -178,12 +204,11 @@ class PerlinNoise:
         seed = abs(int(self.seed))
         if seed > (1 << 63) - 1:
             raise OverflowError("seed is outside the supported signed 64-bit range")
-        use_gpu = device == "gpu"
+        use_gpu = device == "gpu" and _gpu_memory_available()
         if use_gpu and scaled.nbytes + periods.nbytes + result.nbytes >= 2_000_000_000:
             raise ValueError("GPU buffers must total less than 2 GB")
-        kernel = (
-            lib().mpn_perlin_gpu_batch if use_gpu else lib().mpn_perlin_batch
-        )
+        library = lib()
+        kernel = library.mpn_perlin_gpu_batch if use_gpu else library.mpn_perlin_batch
         status = kernel(
             addr(scaled),
             scaled.shape[0],
@@ -193,9 +218,18 @@ class PerlinNoise:
             int(tiled),
             addr(result),
         )
+        if status and use_gpu:
+            status = library.mpn_perlin_batch(
+                addr(scaled),
+                scaled.shape[0],
+                dimensions,
+                seed,
+                addr(periods),
+                int(tiled),
+                addr(result),
+            )
         if status:
-            target = "GPU" if use_gpu else "CPU"
-            raise RuntimeError(f"Perlin {target} kernel failed with status {status}")
+            raise RuntimeError(f"Perlin CPU kernel failed with status {status}")
         reshaped = result.reshape(original_shape)
         return reshaped[()] if scalar_result else reshaped
 

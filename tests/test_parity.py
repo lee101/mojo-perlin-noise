@@ -125,16 +125,49 @@ def test_perlin_gpu_path_or_cpu_fallback():
     assert np.allclose(actual, expected, rtol=2e-14, atol=2e-14)
 
 
-def test_perlin_gpu_failure_is_reported(monkeypatch):
+def test_perlin_gpu_failure_falls_back_to_cpu(monkeypatch):
     points = np.array([[0.125, -0.75], [4.5, 2.25]])
     noise = PerlinNoise(octaves=1.5, seed=71)
+    expected = noise.noise_array(points)
+    cpu_kernel = perlin_module.lib().mpn_perlin_batch
+
     class FakeLibrary:
         mpn_perlin_gpu_batch = staticmethod(lambda *_: 2)
+        mpn_perlin_batch = cpu_kernel
 
     fake_library = FakeLibrary()
+    monkeypatch.setattr(perlin_module, "_gpu_memory_available", lambda: True)
     monkeypatch.setattr(perlin_module, "lib", lambda: fake_library)
-    with pytest.raises(RuntimeError, match="GPU kernel failed with status 2"):
-        noise.noise_array(points, device="gpu")
+    actual = noise.noise_array(points, device="gpu")
+    assert np.array_equal(actual, expected)
+
+
+def test_perlin_gpu_low_memory_falls_back_without_launch(monkeypatch):
+    points = np.array([[0.125, -0.75], [4.5, 2.25]])
+    noise = PerlinNoise(octaves=1.5, seed=71)
+    expected = noise.noise_array(points)
+    cpu_kernel = perlin_module.lib().mpn_perlin_batch
+
+    class FakeLibrary:
+        mpn_perlin_gpu_batch = staticmethod(
+            lambda *_: pytest.fail("GPU kernel must not launch below memory gate")
+        )
+        mpn_perlin_batch = cpu_kernel
+
+    monkeypatch.setattr(perlin_module, "_gpu_memory_available", lambda: False)
+    monkeypatch.setattr(perlin_module, "lib", lambda: FakeLibrary())
+    actual = noise.noise_array(points, device="gpu")
+    assert np.array_equal(actual, expected)
+
+
+def test_perlin_parallel_threshold_and_tail_match_scalar():
+    rng = np.random.default_rng(2026)
+    noise = PerlinNoise(octaves=1.25, seed=314159)
+    for count in (1_023, 1_029):
+        points = rng.uniform(-20, 20, size=(count, 2))
+        actual = noise.noise_array(points)
+        expected = np.array([noise(point.tolist()) for point in points])
+        assert np.array_equal(actual, expected)
 
 
 def test_perlin_large_seed_product_matches_real_upstream():

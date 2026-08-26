@@ -1,6 +1,7 @@
 """Perlin and simplex noise kernels exposed through a small C ABI."""
 
 from std.math import floor
+from max.algorithm import parallelize
 from std.gpu import global_idx
 from max.gpu.host import DeviceContext
 from std.sys.info import simd_width_of
@@ -8,6 +9,9 @@ from std.sys.info import simd_width_of
 comptime FPtr = UnsafePointer[Float64, AnyOrigin[mut=True]]
 comptime IPtr = UnsafePointer[Int64, AnyOrigin[mut=True]]
 comptime U32Ptr = UnsafePointer[UInt32, AnyOrigin[mut=True]]
+comptime PERLIN_PARALLEL_THRESHOLD = 1_024
+comptime PERLIN_PARALLEL_GRAIN = 256
+comptime PERLIN_PARALLEL_WORKERS = 16
 
 
 def mt_twist[state_origin: MutOrigin](
@@ -131,6 +135,48 @@ def mt_seed(mut state: Array[UInt32, 624], seed: UInt128):
     mt_twist(pointer)
 
 
+def mt_seed_one_word(mut state: Array[UInt32, 624], seed: UInt32):
+    var pointer = state.unsafe_ptr()
+    pointer[0] = UInt32(19650218)
+    for i in range(1, 624):
+        var previous = pointer[i - 1]
+        pointer[i] = (
+            UInt32(1812433253) * (previous ^ (previous >> UInt32(30)))
+            + UInt32(i)
+        )
+    var i = 1
+    var count = 624
+    while count > 0:
+        var previous = pointer[i - 1]
+        pointer[i] = (
+            (pointer[i] ^ (
+                (previous ^ (previous >> UInt32(30))) * UInt32(1664525)
+            ))
+            + seed
+        )
+        i += 1
+        if i >= 624:
+            pointer[0] = pointer[623]
+            i = 1
+        count -= 1
+    count = 623
+    while count > 0:
+        var previous = pointer[i - 1]
+        pointer[i] = (
+            (pointer[i] ^ (
+                (previous ^ (previous >> UInt32(30))) * UInt32(1566083941)
+            ))
+            - UInt32(i)
+        )
+        i += 1
+        if i >= 624:
+            pointer[0] = pointer[623]
+            i = 1
+        count -= 1
+    pointer[0] = UInt32(0x80000000)
+    mt_twist(pointer)
+
+
 def mt_word(state: UnsafePointer[UInt32, _], index: Int) -> UInt32:
     var word = state[index]
     word ^= word >> UInt32(11)
@@ -164,38 +210,109 @@ def perlin_sample[coord_origin: MutOrigin, tile_origin: MutOrigin](
 ) -> Float64:
     var total = 0.0
     var corners = 1 << dimensions
-    for corner in range(corners):
-        var hash_value = 1.0
-        var place = 1.0
-        var weight = 1.0
-        for axis in range(dimensions):
-            var base = Int(floor(coordinates[axis]))
-            var bit = (corner >> (dimensions - axis - 1)) & 1
+    var hashed_lattices = Array[Float64, 8](uninitialized=True)
+    var corner_weights = Array[Float64, 8](uninitialized=True)
+    var corner_distances = Array[Float64, 8](uninitialized=True)
+    var hashed_pointer = hashed_lattices.unsafe_ptr()
+    var weight_pointer = corner_weights.unsafe_ptr()
+    var distance_pointer = corner_distances.unsafe_ptr()
+    comptime W = simd_width_of[DType.float64]()
+    var axis = 0
+    while axis + W <= dimensions:
+        var coordinate_vector = coordinates.load[width=W](axis)
+        var base_vector = floor(coordinate_vector)
+        var upper_vector = base_vector + 1.0
+        var hashed_base = base_vector
+        var hashed_upper = upper_vector
+        if tiled:
+            var period_vector = tile_periods.load[width=W](axis)
+            hashed_base -= floor(hashed_base / period_vector) * period_vector
+            hashed_upper -= floor(hashed_upper / period_vector) * period_vector
+        var distance_base = coordinate_vector - base_vector
+        var distance_upper = distance_base - 1.0
+        var fade_base = 1.0 - abs(distance_base)
+        var fade_upper = 1.0 - abs(distance_upper)
+        var base_square = fade_base * fade_base
+        var upper_square = fade_upper * fade_upper
+        hashed_pointer.store(axis, hashed_base)
+        hashed_pointer.store(4 + axis, hashed_upper)
+        distance_pointer.store(axis, distance_base)
+        distance_pointer.store(4 + axis, distance_upper)
+        weight_pointer.store(
+            axis,
+            base_square * fade_base * (
+                fade_base * (fade_base * 6.0 - 15.0) + 10.0
+            ),
+        )
+        weight_pointer.store(
+            4 + axis,
+            upper_square * fade_upper * (
+                fade_upper * (fade_upper * 6.0 - 15.0) + 10.0
+            ),
+        )
+        axis += W
+    while axis < dimensions:
+        var base = Int(floor(coordinates[axis]))
+        for bit in range(2):
+            var index = axis + bit * 4
             var lattice = base + bit
             var hashed_coordinate = Float64(lattice)
             if tiled:
                 var period = tile_periods[axis]
                 hashed_coordinate -= floor(hashed_coordinate / period) * period
-            hash_value += place * hashed_coordinate
-            place *= 10.0
             var distance = coordinates[axis] - Float64(lattice)
-            weight *= fade(1.0 - abs(distance))
+            hashed_lattices[index] = hashed_coordinate
+            corner_distances[index] = distance
+            corner_weights[index] = fade(1.0 - abs(distance))
+        axis += 1
+    for corner in range(corners):
+        var hash_value = 1.0
+        var place = 1.0
+        var weight = 1.0
+        for axis in range(dimensions):
+            var bit = (corner >> (dimensions - axis - 1)) & 1
+            var index = axis + bit * 4
+            hash_value += place * hashed_lattices[index]
+            place *= 10.0
+            weight *= corner_weights[index]
 
         var integer_hash = Int(abs(hash_value))
         if integer_hash < 1:
             integer_hash = 1
-        var state = Array[UInt32, 624](fill=UInt32(0))
-        mt_seed(state, UInt128(seed) * UInt128(integer_hash))
+        var state = Array[UInt32, 624](uninitialized=True)
+        var combined_seed = UInt128(seed) * UInt128(integer_hash)
+        if combined_seed <= UInt128(0xFFFFFFFF):
+            mt_seed_one_word(state, UInt32(combined_seed))
+        else:
+            mt_seed(state, combined_seed)
         var pointer = state.unsafe_ptr()
         var dot_product = 0.0
         for axis in range(dimensions):
-            var base = Int(floor(coordinates[axis]))
             var bit = (corner >> (dimensions - axis - 1)) & 1
-            var distance = coordinates[axis] - Float64(base + bit)
             var gradient = -1.0 + 2.0 * mt_random(pointer, axis * 2)
-            dot_product += gradient * distance
+            dot_product += gradient * corner_distances[axis + bit * 4]
         total += weight * dot_product
     return total
+
+
+def perlin_batch_range(
+    coordinates: FPtr,
+    results: FPtr,
+    start: Int,
+    stop: Int,
+    dimensions: Int,
+    seed: UInt64,
+    tile_periods: FPtr,
+    tiled: Bool,
+):
+    for row in range(start, stop):
+        results[row] = perlin_sample(
+            coordinates + row * dimensions,
+            dimensions,
+            seed,
+            tile_periods,
+            tiled,
+        )
 
 
 @export("mpn_perlin_scalar")
@@ -251,25 +368,38 @@ def mpn_perlin_batch(
         return 1
     var coordinates = FPtr(unsafe_from_address=coordinates_addr)
     var results = FPtr(unsafe_from_address=result_addr)
+    var tile_periods = coordinates
     if tiled_value != 0:
-        var tile_periods = FPtr(unsafe_from_address=tile_periods_addr)
-        for row in range(count):
-            results[row] = perlin_sample(
-                coordinates + row * dimensions,
-                dimensions,
-                UInt64(seed_value),
-                tile_periods,
-                True,
-            )
-    else:
-        for row in range(count):
-            results[row] = perlin_sample(
-                coordinates + row * dimensions,
-                dimensions,
-                UInt64(seed_value),
-                coordinates,
-                False,
-            )
+        tile_periods = FPtr(unsafe_from_address=tile_periods_addr)
+    var tiled = tiled_value != 0
+    var seed = UInt64(seed_value)
+    if count < PERLIN_PARALLEL_THRESHOLD:
+        perlin_batch_range(
+            coordinates, results, 0, count, dimensions, seed, tile_periods, tiled
+        )
+        return 0
+    var tasks = (count + PERLIN_PARALLEL_GRAIN - 1) // PERLIN_PARALLEL_GRAIN
+
+    @always_inline
+    def work(task: Int) {
+        imm coordinates, imm results, imm count, imm dimensions,
+        imm seed, imm tile_periods, imm tiled,
+    }:
+        var start = task * PERLIN_PARALLEL_GRAIN
+        perlin_batch_range(
+            coordinates,
+            results,
+            start,
+            min(start + PERLIN_PARALLEL_GRAIN, count),
+            dimensions,
+            seed,
+            tile_periods,
+            tiled,
+        )
+
+    parallelize(
+        work, tasks, min(tasks, PERLIN_PARALLEL_WORKERS)
+    )
     return 0
 
 
@@ -317,29 +447,29 @@ def mpn_perlin_gpu_batch(
         var coordinates = FPtr(unsafe_from_address=coordinates_addr)
         var tile_periods = FPtr(unsafe_from_address=tile_periods_addr)
         var results = FPtr(unsafe_from_address=result_addr)
-        var ctx = DeviceContext()
-        var device_coordinates = (
-            ctx.enqueue_create_buffer[DType.float64](count * dimensions)
-        )
-        var device_periods = (
-            ctx.enqueue_create_buffer[DType.float64](dimensions)
-        )
-        var device_results = ctx.enqueue_create_buffer[DType.float64](count)
-        ctx.enqueue_copy(device_coordinates, coordinates)
-        ctx.enqueue_copy(device_periods, tile_periods)
-        ctx.enqueue_function[perlin_gpu_kernel](
-            device_coordinates,
-            Int64(count),
-            Int64(dimensions),
-            UInt64(seed_value),
-            device_periods,
-            Int64(tiled_value),
-            device_results,
-            grid_dim=(count + 127) // 128,
-            block_dim=128,
-        )
-        ctx.enqueue_copy(results, device_results)
-        ctx.synchronize()
+        with DeviceContext() as ctx:
+            var device_coordinates = (
+                ctx.enqueue_create_buffer[DType.float64](count * dimensions)
+            )
+            var device_periods = (
+                ctx.enqueue_create_buffer[DType.float64](dimensions)
+            )
+            var device_results = ctx.enqueue_create_buffer[DType.float64](count)
+            ctx.enqueue_copy(device_coordinates, coordinates)
+            ctx.enqueue_copy(device_periods, tile_periods)
+            ctx.enqueue_function[perlin_gpu_kernel](
+                device_coordinates,
+                Int64(count),
+                Int64(dimensions),
+                UInt64(seed_value),
+                device_periods,
+                Int64(tiled_value),
+                device_results,
+                grid_dim=(count + 127) // 128,
+                block_dim=128,
+            )
+            ctx.enqueue_copy(results, device_results)
+            ctx.synchronize()
         return 0
     except:
         return 2
