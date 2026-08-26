@@ -2,7 +2,7 @@
 
 from std.math import floor
 from std.gpu import global_idx
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.sys.info import simd_width_of
 
 comptime FPtr = UnsafePointer[Float64, AnyOrigin[mut=True]]
@@ -65,7 +65,7 @@ def mt_twist[state_origin: MutOrigin](
     )
 
 
-def mt_seed(mut state: InlineArray[UInt32, 624], seed: UInt128):
+def mt_seed(mut state: Array[UInt32, 624], seed: UInt128):
     var pointer = state.unsafe_ptr()
     pointer[0] = UInt32(19650218)
     for i in range(1, 624):
@@ -184,7 +184,7 @@ def perlin_sample[coord_origin: MutOrigin, tile_origin: MutOrigin](
         var integer_hash = Int(abs(hash_value))
         if integer_hash < 1:
             integer_hash = 1
-        var state = InlineArray[UInt32, 624](fill=UInt32(0))
+        var state = Array[UInt32, 624](fill=UInt32(0))
         mt_seed(state, UInt128(seed) * UInt128(integer_hash))
         var pointer = state.unsafe_ptr()
         var dot_product = 0.0
@@ -212,8 +212,8 @@ def mpn_perlin_scalar(
     t2: Float64,
     t3: Float64,
 ) abi("C") -> Float64:
-    var coordinates = InlineArray[Float64, 4](fill=0.0)
-    var tile_periods = InlineArray[Float64, 4](fill=1.0)
+    var coordinates = Array[Float64, 4](fill=0.0)
+    var tile_periods = Array[Float64, 4](fill=1.0)
     coordinates[0] = x0
     coordinates[1] = x1
     coordinates[2] = x2
@@ -275,18 +275,19 @@ def mpn_perlin_batch(
 
 def perlin_gpu_kernel(
     coordinates: FPtr,
-    count: Int,
-    dimensions: Int,
+    count: Int64,
+    dimensions: Int64,
     seed: UInt64,
     tile_periods: FPtr,
-    tiled: Int,
+    tiled: Int64,
     results: FPtr,
 ):
     var row = global_idx.x
-    if row < count:
+    var dimension_count = Int(dimensions)
+    if row < Int(count):
         results[row] = perlin_sample(
-            coordinates + row * dimensions,
-            dimensions,
+            coordinates + row * dimension_count,
+            dimension_count,
             seed,
             tile_periods,
             tiled != 0,
@@ -328,11 +329,11 @@ def mpn_perlin_gpu_batch(
         ctx.enqueue_copy(device_periods, tile_periods)
         ctx.enqueue_function[perlin_gpu_kernel](
             device_coordinates,
-            count,
-            dimensions,
+            Int64(count),
+            Int64(dimensions),
             UInt64(seed_value),
             device_periods,
-            tiled_value,
+            Int64(tiled_value),
             device_results,
             grid_dim=(count + 127) // 128,
             block_dim=128,
