@@ -2,7 +2,7 @@
 
 from std.math import floor
 from max.algorithm import parallelize
-from std.gpu import global_idx
+from max.gpu import global_idx
 from max.gpu.host import DeviceContext
 from std.sys.info import simd_width_of
 
