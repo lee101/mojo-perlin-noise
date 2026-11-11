@@ -24,11 +24,11 @@ def mt_twist[state_origin: MutOrigin](
     var i = 0
     while i + W <= 227:
         var word_vec_first = (
-            state.load[width=W](i) & upper
-        ) | (state.load[width=W](i + 1) & lower)
+            state.unsafe_load[width=W](i) & upper
+        ) | (state.unsafe_load[width=W](i + 1) & lower)
         state.store(
             i,
-            state.load[width=W](i + 397)
+            state.unsafe_load[width=W](i + 397)
             ^ (word_vec_first >> UInt32(1))
             ^ ((word_vec_first & UInt32(1)) * matrix_a),
         )
@@ -44,11 +44,11 @@ def mt_twist[state_origin: MutOrigin](
     i = 227
     while i + W <= 623:
         var word_vec_second = (
-            state.load[width=W](i) & upper
-        ) | (state.load[width=W](i + 1) & lower)
+            state.unsafe_load[width=W](i) & upper
+        ) | (state.unsafe_load[width=W](i + 1) & lower)
         state.store(
             i,
-            state.load[width=W](i - 227)
+            state.unsafe_load[width=W](i - 227)
             ^ (word_vec_second >> UInt32(1))
             ^ ((word_vec_second & UInt32(1)) * matrix_a),
         )
@@ -219,13 +219,13 @@ def perlin_sample[coord_origin: MutOrigin, tile_origin: MutOrigin](
     comptime W = simd_width_of[DType.float64]()
     var axis = 0
     while axis + W <= dimensions:
-        var coordinate_vector = coordinates.load[width=W](axis)
+        var coordinate_vector = coordinates.unsafe_load[width=W](axis)
         var base_vector = floor(coordinate_vector)
         var upper_vector = base_vector + 1.0
         var hashed_base = base_vector
         var hashed_upper = upper_vector
         if tiled:
-            var period_vector = tile_periods.load[width=W](axis)
+            var period_vector = tile_periods.unsafe_load[width=W](axis)
             hashed_base -= floor(hashed_base / period_vector) * period_vector
             hashed_upper -= floor(hashed_upper / period_vector) * period_vector
         var distance_base = coordinate_vector - base_vector
